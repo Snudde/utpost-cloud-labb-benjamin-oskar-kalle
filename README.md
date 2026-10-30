@@ -37,7 +37,7 @@ npm run dev:client                    # Vue-klienten på :3001 med hot reload, /
 - `client/` – ny klient i Vue 3 + TypeScript (port 3001). GraphQL med urql (`src/urql.ts`, cache i klienten) och typer genererade ur schemat (`codegen.ts` → `src/gql/`, M5). `client/Dockerfile` är multi-stage: Node bygger, nginx serverar (`client/nginx.conf.template`, renderas vid start).
 - `shared/` – API-kontraktet som TypeScript-typer (`@utpost/shared`), används av `api/` och `client/`.
 - `web/` – den gamla React-klienten. Portas vy för vy till `client/`, tas bort i M6.
-- `infra/azure/` – staging i Azure Container Apps (M6): `staging.yaml` beskriver appen (client + api + postgres + mongo som sidecars), `skapa-staging.sh` skapar den en gång. Pipelinen byter sedan bara image.
+- `infra/azure/` – staging i Azure Container Apps (M6): `staging.yaml` beskriver appen (client + api + postgres + mongo som sidecars), `skapa-staging.sh` skapar den en gång, `identitet.sh` ger pipelinen en lösenordsfri inloggning (OIDC). Pipelinen byter sedan bara image.
 - `compose.yaml` – hela miljön. `docs/decisions/` – teamets beslutsdokument.
 
 ## Kommandon (kör från roten)
@@ -73,3 +73,7 @@ Pipelinen (jobbet *Image* i `.github/workflows/ci.yml`) bygger `api` och `client
 ## Deploy
 
 Se *I molnet (M6)* ovan: staging skapas en gång med `infra/azure/skapa-staging.sh`, och pipelinen byter image vid varje merge till `main`.
+
+Pipelinen loggar in i Azure utan lösenord (OIDC). Identiteten skapas en gång med `infra/azure/identitet.sh`, och id:na ligger som *variables* på GitHub-miljön `azure-staging` – det finns inga secrets. Jobbet *Deploy → Azure staging* körs bara på `main` (på en PR visas det som överhoppat), väntar tills `/api/health` svarar med merge-commitens sha och röktestar `/graphql`. Detaljer och vanliga fel i `docs/pipeline.md`.
+
+    az containerapp revision list --name utpost-staging --resource-group <resursgrupp> --output table   # en deploy = två revisioner
