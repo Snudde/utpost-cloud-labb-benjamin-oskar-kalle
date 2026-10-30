@@ -19,10 +19,9 @@ flowchart LR
   S -->|ja| M[merge – knappen är grön]
   S -->|nej| F[fixa, pusha igen<br/>körningen startar om]
   M --> MAIN[main är alltid byggbar]
-  MAIN --> D[Deploy → Azure staging<br/>OIDC-inloggning · byter image · väntar på rätt sha · röktest]
+  MAIN --> D[Deploy → Azure staging<br/>OIDC-inloggning · byt image till sha · vänta på /api/health · röktest]
+  D --> ST[staging kör den mergade committen]
 ```
-
-På en PR körs fyra jobb (Kvalitet, Bygg, Integration, Image) – Deploy visas som *överhoppat*. Först efter merge, på `main`, körs Deploy.
 
 ## Vad som körs, och varför
 
@@ -34,8 +33,8 @@ På en PR körs fyra jobb (Kvalitet, Bygg, Integration, Image) – Deploy visas 
 | Bygg | `npm run build` (`vite build` av `client/`) | importfel, trasiga templates, allt som bara syns vid bygge | ~2 s |
 | Typkontroll (M2, M5) | `npm run typecheck` (codegen + `vue-tsc` + `tsc`) | ett fält som tagits bort ur schemat men används i en vy – kedjan schema → fråga → vy | ~10 s |
 | Integration (M5) | `npm run test:api` mot Postgres och Mongo som *services* | resolvers som inte stämmer med databasen, N+1 som kommit tillbaka, mutationer utan inloggningskrav – det klientens mockade tester aldrig ser | ~40 s inkl. start av databaserna |
+| Deploy (M6) | `az containerapp update … --image …:sha-…` ×2 (api, client – två revisioner per deploy), vänta på `sha` i `/api/health` och på sista revisionen, röktest `/graphql` | en image som inte startar, en nginx-mall som inte renderas, en app som inte kommer upp – innan någon användare ser det | ~1,5 min (95 s) (bara på `main`; väcks appen från noll tillkommer ~1 min) |
 | Image (M4) | `docker/build-push-action` på `api/Dockerfile` och `client/Dockerfile` | en Dockerfile som inte går att bygga; på `main` publiceras imagerna med `sha-`tagg | ~1,5 min |
-| Deploy (M6) | `azure/login` (OIDC) + `az containerapp update` på `api` och `client`, sedan `curl` mot `/api/health` och `/graphql` | en image som inte startar i molnet, fel miljövariabler, nginx som inte når api:et – det som bara syns i en riktig miljö. Bara på `main`. | ~1–3 min (längre om appen väcks från noll) |
 
 `npm ci` (~25 s) dominerar – den installerar alla tre workspaces inklusive React-klientens beroenden. När `web/` tas bort (M6) halveras tiden.
 
@@ -43,9 +42,10 @@ På en PR körs fyra jobb (Kvalitet, Bygg, Integration, Image) – Deploy visas 
 
 - Kräver PR – ingen pushar direkt till `main`
 - Kräver status checks **Kvalitet**, **Bygg**, **Integration** och **Image** gröna innan merge
-- **Deploy** ska *inte* vara en krävd check – den körs aldrig på en PR, så en PR skulle aldrig kunna mergas
 - Kräver att branchen är uppdaterad mot `main` före merge (annars testas en kod som aldrig kommer att finnas)
 - Gäller även admins
+- *Deploy → Azure staging* är **inte** en status check: den körs efter merge, på `main`. Blir den röd är `main` ändå korrekt – det är staging som inte uppdaterades. Rätta och merga igen, eller rulla tillbaka med `az containerapp update … --image <förra sha-taggen>` (varje image i GHCR har sin sha-tagg kvar).
+  Revisioner 30/10: `utpost-staging--sha-e59f6d3-api` och `utpost-staging--sha-e59f6d3` (deploy)
 
 ## Vanliga fel vi sett
 
@@ -53,18 +53,8 @@ På en PR körs fyra jobb (Kvalitet, Bygg, Integration, Image) – Deploy visas 
 - **`format:check` rött:** kör `npm run format --workspace=client` och committa. CI ska aldrig ändra kod, bara säga nej.
 - **Status check heter fel i rulesetet:** namnet är jobbets `name:` (Kvalitet, Bygg, Integration, Image) – inte filnamnet.
 - **Integration rött men testerna gröna lokalt:** databasen i jobbet är tom tills `npm run seed` körts, och `Tour.logs` läser Mongo – `npm run migrate:logs` måste också ha körts. Portarna är `5432`/`27017` på `localhost` i jobbet, inte `5433` som i compose.
-
-## Deploy till staging (M6)
-
-- **Inga lösenord i GitHub.** Jobbet loggar in i Azure med OIDC: GitHub ger jobbet en kortlivad token, och Azure litar på den bara för miljön `azure-staging` i det här repot (`infra/azure/identitet.sh`). Identiteten har Contributor på resursgruppen, inget mer.
-- **Miljön `azure-staging`** har sex *variables* och inga secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RG`, `AZURE_APP`, `AZURE_URL`.
-- **Varje deploy ger två revisioner** – `…--sha-1a2b3c4-api` (ny api, gammal client) och `…--sha-1a2b3c4` (båda nya). Se dem med `az containerapp revision list --name $APP --resource-group $RG --output table`.
-- **Klart betyder:** `/api/health` svarar med merge-commitens sha *och* den senaste klara revisionen är client-revisionen. Sedan röktestas `/graphql` genom nginx.
-- **Omkörning kräver en ny commit** – revisionssuffixet är unikt per sha och kan bara användas en gång.
-
-### Vanliga fel vid deploy
-
-- **`AADSTS70021` / no matching federated identity:** subject i den federerade identiteten matchar inte jobbet – fel repo eller fel miljönamn.
-- **`AuthorizationFailed`:** identiteten saknar Contributor på resursgruppen – kör om rolltilldelningen i `identitet.sh`.
-- **Väntar 30 försök utan rätt sha:** imagen startar inte. Kolla *Revisions and replicas* i portalen eller `az containerapp logs show --container api`.
-- **`MissingSubscription` när skripten körs i Git Bash på Windows:** Git Bash gör om `/subscriptions/…` till en Windows-sökväg. Kör med `MSYS_NO_PATHCONV=1` framför.
+- **Deploy rött med *AADSTS700213 No matching federated identity record*:** subjectet stämmer inte. Felmeddelandet skriver ut det subject GitHub skickade – skapa en federerad identitet till med exakt det värdet (`az ad app federated-credential create`, nytt `name`). Jobbet måste också ha `environment: azure-staging`.
+- **Deploy rött på *Vänta tills staging kör den här committen*:** appen startar från noll (fyra containrar + seed, ~1 min) – 30 försök à 10 s brukar räcka. Står `sha` kvar på det gamla värdet efter fem minuter: revisionen startade inte. `az containerapp logs show --name utpost-staging --resource-group utpost-kalle-salomonsson-rg --container api --tail 50`.
+- **Deploy rött på röktestet men väntan grön:** `/api/health` svarar genom nginx (så `API_UPSTREAM` är rätt), men GraphQL ger ingen data – databasen är tom (`SEED_ON_START` saknas eller seeden misslyckades: `az containerapp logs show … --container api`). Är det väntan som är röd med `502`/inget svar är det nginx som inte når api: `API_UPSTREAM` ska vara `localhost:4000` i Azure.
+- **Deploy rött på *revision already exists*:** jobbet kördes om (Re-run) och revisionssuffixet `sha-<7>` är redan använt. Suffixet är commitens sha, så vägen framåt är en ny commit – inte Re-run.
+- Loggkommandona ovan har våra namn (`utpost-staging`, `utpost-kalle-salomonsson-rg`) – mallens var `utpost-staging`, `utpost-rg`.
